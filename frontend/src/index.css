@@ -1,0 +1,14 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  background-color: #F6F4EE;
+  color: #16302A;
+}
+
+/* subtle focus ring for accessibility, not the browser default blue */
+:focus-visible {
+  outline: 2px solid #C99A3E;
+  outline-offset: 2px;
+}
