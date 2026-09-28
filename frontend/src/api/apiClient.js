@@ -17,14 +17,41 @@ export async function createJob({ title, description, experience }) {
   return handleResponse(res)
 }
 
-export async function uploadResumes(files) {
+export async function listJobs() {
+  const res = await fetch(`${API_BASE}/jobs`)
+  return handleResponse(res)
+}
+
+// Deletes a role and its scores. Resume files are kept (they may belong to other roles).
+// onlyIfEmpty makes the server refuse (409) unless the role has no resumes and no scores.
+export async function deleteJob(jobId, { onlyIfEmpty = false } = {}) {
+  const res = await fetch(`${API_BASE}/jobs/${jobId}${onlyIfEmpty ? '?only_if_empty=true' : ''}`, {
+    method: 'DELETE',
+  })
+  return handleResponse(res)
+}
+
+export async function uploadResumes(jobId, files) {
   const formData = new FormData()
+  formData.append('job_id', jobId)
   files.forEach((file) => formData.append('files', file))
 
   const res = await fetch(`${API_BASE}/resumes/upload`, {
     method: 'POST',
     body: formData,
   })
+  return handleResponse(res)
+}
+
+// Resumes in one job's batch, with processing status. Stuck ones come back
+// as "failed" (with a reason), so polling this always reaches a final state.
+export async function listJobResumes(jobId) {
+  const res = await fetch(`${API_BASE}/jobs/${jobId}/resumes`)
+  return handleResponse(res)
+}
+
+export async function retryResume(resumeId) {
+  const res = await fetch(`${API_BASE}/resumes/${resumeId}/retry`, { method: 'POST' })
   return handleResponse(res)
 }
 

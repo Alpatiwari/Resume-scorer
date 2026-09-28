@@ -1,9 +1,12 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import JobDescriptionForm from '../components/JobDescriptionForm.jsx'
 import UploadResumes from '../components/UploadResumes.jsx'
 import ResultsTable from '../components/ResultsTable.jsx'
 import ScoreBreakdown from '../components/ScoreBreakdown.jsx'
+import RolesList from '../components/RolesList.jsx'
 import {
+  listJobs,
+  deleteJob,
   startScoring,
   getScoringStatus,
   getScores,
@@ -15,6 +18,24 @@ import {
 import { STAGES } from '../constants.js'
 
 const POLL_INTERVAL_MS = 1500
+const LAST_ROLE_KEY = 'resume-scorer:last-role'
+
+function rememberRole(id) {
+  try {
+    if (id) localStorage.setItem(LAST_ROLE_KEY, id)
+    else localStorage.removeItem(LAST_ROLE_KEY)
+  } catch {
+    // storage unavailable (private mode) — remembering the role is optional
+  }
+}
+
+function recalledRole() {
+  try {
+    return localStorage.getItem(LAST_ROLE_KEY)
+  } catch {
+    return null
+  }
+}
 
 export default function Dashboard() {
   const [job, setJob] = useState(null)
@@ -27,11 +48,113 @@ export default function Dashboard() {
   const [stageFilter, setStageFilter] = useState('')
   const [minScore, setMinScore] = useState(0)
   const [shortlistOnly, setShortlistOnly] = useState(false)
+  const [roles, setRoles] = useState([])
   const pollRef = useRef(null)
+  const selectTokenRef = useRef(0) // guards against a slow click finishing after a newer one
+  const knownResumeCountRef = useRef(null)
 
-  function handleUploaded(uploadResults) {
-    const parsed = uploadResults.filter((r) => r.status === 'parsed').length
-    setParsedCount((prev) => prev + parsed)
+  async function loadRoles() {
+    try {
+      const list = await listJobs()
+      setRoles(list)
+      return list
+    } catch {
+      return []
+    }
+  }
+
+  function resetView() {
+    stopPolling()
+    setResults([])
+    setParsedCount(0)
+    setProgress(null)
+    setScoreError(null)
+    setIsScoring(false)
+    setSelectedId(null)
+    setMinScore(0)
+    setShortlistOnly(false)
+    setStageFilter('')
+    knownResumeCountRef.current = null
+  }
+
+  // Reopens a saved role: shows its saved ranking straight from the
+  // database (no re-scoring), and picks up a scoring run still in progress.
+  async function handleSelectRole(role) {
+    const token = ++selectTokenRef.current
+    resetView()
+    setJob({ id: role.id, title: role.title })
+    rememberRole(role.id)
+
+    try {
+      const saved = await getScores(role.id)
+      if (token === selectTokenRef.current) setResults(saved)
+    } catch {
+      // 404 just means "not scored yet" — leave the table empty
+    }
+
+    // Ask the server (the roles list can be a few seconds stale) whether a
+    // scoring run is still going, and if so keep following it.
+    try {
+      const status = await getScoringStatus(role.id)
+      if (token !== selectTokenRef.current) return
+      if (status.status === 'queued' || status.status === 'running') {
+        setIsScoring(true)
+        setProgress({ done: status.done, total: status.total })
+        startPolling(role.id)
+      }
+    } catch {
+      // status unavailable — the saved results above are still shown
+    }
+  }
+
+  // On first load, reopen whichever role was open before the refresh.
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      const list = await loadRoles()
+      if (cancelled) return
+      const last = recalledRole()
+      const match = list.find((r) => r.id === last)
+      if (match) handleSelectRole(match)
+    })()
+    return () => {
+      cancelled = true
+      stopPolling()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Called by UploadResumes with this role's resumes whenever their status
+  // changes. The count comes from the server's view of THIS role's batch.
+  function handleResumesChanged(list) {
+    setParsedCount(list.filter((r) => r.status === 'parsed').length)
+    // Keep the "Your roles" counts fresh when the batch grows.
+    if (knownResumeCountRef.current !== null && knownResumeCountRef.current !== list.length) {
+      loadRoles()
+    }
+    knownResumeCountRef.current = list.length
+  }
+
+  function handleJobSaved(newJob) {
+    // A new role starts with a clean slate: its own batch, its own results.
+    ++selectTokenRef.current
+    resetView()
+    setJob(newJob)
+    rememberRole(newJob.id)
+    loadRoles()
+  }
+
+  // Deletes a role (and its scores). If it's the one open on screen, clear the
+  // view so nothing keeps pointing at a role that no longer exists.
+  async function handleDeleteRole(role, opts) {
+    await deleteJob(role.id, opts) // throws on failure; RolesList shows the message
+    if (role.id === job?.id) {
+      ++selectTokenRef.current
+      resetView()
+      setJob(null)
+      rememberRole(null)
+    }
+    await loadRoles()
   }
 
   function stopPolling() {
@@ -39,6 +162,36 @@ export default function Dashboard() {
       clearInterval(pollRef.current)
       pollRef.current = null
     }
+  }
+
+  function startPolling(jobId) {
+    stopPolling()
+    pollRef.current = setInterval(async () => {
+      try {
+        const status = await getScoringStatus(jobId)
+        setProgress({ done: status.done, total: status.total })
+
+        if (status.status === 'done') {
+          stopPolling()
+          const scored = await getScores(jobId)
+          setResults(scored)
+          // A finished run can still carry warnings (AI unavailable for some
+          // resumes, etc). Show them instead of reporting a clean "done".
+          if (status.error) setScoreError(status.error)
+          setIsScoring(false)
+          loadRoles()
+        } else if (status.status === 'failed') {
+          stopPolling()
+          setScoreError(status.error || 'Scoring failed.')
+          setIsScoring(false)
+          loadRoles()
+        }
+      } catch (err) {
+        stopPolling()
+        setScoreError(err.message || 'Lost connection while checking scoring progress.')
+        setIsScoring(false)
+      }
+    }, POLL_INTERVAL_MS)
   }
 
   async function handleScore() {
@@ -56,27 +209,7 @@ export default function Dashboard() {
       return
     }
 
-    pollRef.current = setInterval(async () => {
-      try {
-        const status = await getScoringStatus(job.id)
-        setProgress({ done: status.done, total: status.total })
-
-        if (status.status === 'done') {
-          stopPolling()
-          const scored = await getScores(job.id)
-          setResults(scored)
-          setIsScoring(false)
-        } else if (status.status === 'failed') {
-          stopPolling()
-          setScoreError(status.error || 'Scoring failed.')
-          setIsScoring(false)
-        }
-      } catch (err) {
-        stopPolling()
-        setScoreError(err.message || 'Lost connection while checking scoring progress.')
-        setIsScoring(false)
-      }
-    }, POLL_INTERVAL_MS)
+    startPolling(job.id)
   }
 
   async function handleToggleShortlist(row) {
@@ -136,7 +269,13 @@ export default function Dashboard() {
 
       <main className="mx-auto grid max-w-6xl grid-cols-1 gap-8 px-8 py-10 lg:grid-cols-[minmax(0,340px)_1fr]">
         <section className="rounded-lg border border-line bg-white/60 p-6">
-          <JobDescriptionForm onSubmit={setJob} />
+          <RolesList
+            roles={roles}
+            activeId={job?.id}
+            onSelect={handleSelectRole}
+            onDelete={handleDeleteRole}
+          />
+          <JobDescriptionForm onSubmit={handleJobSaved} />
           {job && (
             <p className="mt-4 rounded-md bg-gold-soft/50 px-3 py-2 text-xs text-ink-soft">
               Role saved — resumes will be scored against "{job.title}".
@@ -145,7 +284,7 @@ export default function Dashboard() {
         </section>
 
         <section className="flex flex-col gap-8">
-          <UploadResumes disabled={!job} onUploaded={handleUploaded} />
+          <UploadResumes jobId={job?.id} disabled={!job} onResumesChanged={handleResumesChanged} />
 
           <div>
             <div className="mb-3 flex items-center justify-between gap-4">

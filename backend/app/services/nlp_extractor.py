@@ -14,11 +14,14 @@ If GEMINI_API_KEY isn't set (or the call fails), the LLM pass is skipped
 and callers fall back to regex-only results — the pipeline still works,
 just less richly.
 """
+import logging
 import re
 from dataclasses import dataclass, field
 
 from app.services.gemini_client import GeminiUnavailableError, chat_json
 from app.services.skill_dictionary import SKILL_ALIASES
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -28,6 +31,8 @@ class ResumeProfile:
     education: list[str] = field(default_factory=list)
     projects: list[str] = field(default_factory=list)
     red_flags: list[str] = field(default_factory=list)
+    # Set when the AI extraction pass failed and only regex results were used.
+    llm_error: str | None = None
 
 
 @dataclass
@@ -36,6 +41,7 @@ class JobRequirements:
     nice_to_have_skills: list[str] = field(default_factory=list)
     min_experience_years: float | None = None
     key_responsibilities: list[str] = field(default_factory=list)
+    llm_error: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -107,16 +113,32 @@ Job description:
 ---"""
 
 
-def _call_llm_json(prompt: str) -> dict | None:
-    """Calls Gemini and returns the parsed JSON response, or None if
-    Gemini isn't available — so callers can gracefully fall back to
-    regex-only results."""
+def _call_llm_json(prompt: str) -> tuple[dict | None, str | None]:
+    """Calls Gemini. Returns (data, None) on success or (None, reason) on
+    failure, so callers can fall back to regex-only results AND report that
+    they did — a failed enrichment pass must be visible, not invisible."""
     try:
-        return chat_json(prompt)
-    except GeminiUnavailableError:
-        # Extraction is an enrichment layer — never let Gemini being
-        # unavailable break the pipeline. The regex pass still ran.
+        data = chat_json(prompt)
+    except GeminiUnavailableError as e:
+        logger.warning("AI extraction unavailable, using regex only: %s", e)
+        return None, str(e)
+    if not isinstance(data, dict):
+        return None, "Gemini returned JSON that is not an object."
+    return data, None
+
+
+def _str_list(value) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(x).strip() for x in value if str(x).strip()]
+
+
+def _num_or_none(value) -> float | None:
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
         return None
+    return n if n >= 0 and n == n else None  # rejects negatives and NaN
 
 
 # ---------------------------------------------------------------------------
@@ -127,36 +149,40 @@ def extract_resume_profile(text: str) -> ResumeProfile:
     regex_skills = _find_skills_regex(text)
     regex_years = _find_experience_years_regex(text)
 
-    llm_data = _call_llm_json(_RESUME_EXTRACTION_PROMPT.format(text=text[:12000]))
+    llm_data, llm_error = _call_llm_json(_RESUME_EXTRACTION_PROMPT.format(text=text[:12000]))
 
     if llm_data:
-        merged_skills = sorted(set(regex_skills) | {s.strip() for s in llm_data.get("skills", []) if s.strip()})
+        merged_skills = sorted(set(regex_skills) | set(_str_list(llm_data.get("skills"))))
+        years = _num_or_none(llm_data.get("experience_years"))
         return ResumeProfile(
             skills=merged_skills,
-            experience_years=llm_data.get("experience_years") or regex_years,
-            education=llm_data.get("education", []),
-            projects=llm_data.get("projects", []),
-            red_flags=llm_data.get("red_flags", []),
+            experience_years=years if years else regex_years,
+            education=_str_list(llm_data.get("education")),
+            projects=_str_list(llm_data.get("projects")),
+            red_flags=_str_list(llm_data.get("red_flags")),
         )
 
-    return ResumeProfile(skills=sorted(set(regex_skills)), experience_years=regex_years)
+    return ResumeProfile(
+        skills=sorted(set(regex_skills)), experience_years=regex_years, llm_error=llm_error
+    )
 
 
 def extract_job_requirements(text: str) -> JobRequirements:
     regex_skills = _find_skills_regex(text)
     regex_years = _find_experience_years_regex(text)
 
-    llm_data = _call_llm_json(_JOB_EXTRACTION_PROMPT.format(text=text[:12000]))
+    llm_data, llm_error = _call_llm_json(_JOB_EXTRACTION_PROMPT.format(text=text[:12000]))
 
     if llm_data:
-        merged_required = sorted(
-            set(regex_skills) | {s.strip() for s in llm_data.get("required_skills", []) if s.strip()}
-        )
+        merged_required = sorted(set(regex_skills) | set(_str_list(llm_data.get("required_skills"))))
+        years = _num_or_none(llm_data.get("min_experience_years"))
         return JobRequirements(
             required_skills=merged_required,
-            nice_to_have_skills=llm_data.get("nice_to_have_skills", []),
-            min_experience_years=llm_data.get("min_experience_years") or regex_years,
-            key_responsibilities=llm_data.get("key_responsibilities", []),
+            nice_to_have_skills=_str_list(llm_data.get("nice_to_have_skills")),
+            min_experience_years=years if years else regex_years,
+            key_responsibilities=_str_list(llm_data.get("key_responsibilities")),
         )
 
-    return JobRequirements(required_skills=sorted(set(regex_skills)), min_experience_years=regex_years)
+    return JobRequirements(
+        required_skills=sorted(set(regex_skills)), min_experience_years=regex_years, llm_error=llm_error
+    )

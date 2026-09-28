@@ -46,6 +46,15 @@ export default function ResultsTable({ results = [], onSelect, onToggleShortlist
                 <span className="rounded-full bg-gold-soft px-2.5 py-0.5 text-xs font-medium text-ink">
                   {r.final_score}
                 </span>
+                {r.score_warnings?.length > 0 && (
+                  <span
+                    className="ml-1.5 cursor-help text-amber-600"
+                    title={r.score_warnings.join('\n')}
+                    aria-label="Score is degraded — open the breakdown for details"
+                  >
+                    ⚠
+                  </span>
+                )}
               </td>
               <td className="px-4 py-3" onClick={(e) => e.stopPropagation()}>
                 <select

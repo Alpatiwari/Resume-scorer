@@ -152,15 +152,33 @@ export default function ScoreBreakdown({ candidate, onClose, onChangeStage }) {
             <div key={leg.label} className="flex items-center gap-3">
               <span className="w-40 shrink-0 text-xs text-ink-soft">{leg.label}</span>
               <div className="h-2 flex-1 overflow-hidden rounded-full bg-paper">
-                <div
-                  className="h-full rounded-full bg-gold"
-                  style={{ width: `${Math.max(0, Math.min(100, leg.value))}%` }}
-                />
+                {leg.value != null && (
+                  <div
+                    className="h-full rounded-full bg-gold"
+                    style={{ width: `${Math.max(0, Math.min(100, leg.value))}%` }}
+                  />
+                )}
               </div>
-              <span className="w-10 shrink-0 text-right text-xs text-ink">{leg.value}</span>
+              <span
+                className="w-10 shrink-0 text-right text-xs text-ink"
+                title={leg.value == null ? 'Not available — not counted in the score' : undefined}
+              >
+                {leg.value == null ? 'N/A' : leg.value}
+              </span>
             </div>
           ))}
         </div>
+
+        {candidate.score_warnings?.length > 0 && (
+          <div className="mb-5 rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-800">
+            <p className="mb-1 font-medium">This score is degraded</p>
+            <ul className="list-inside list-disc">
+              {candidate.score_warnings.map((w) => (
+                <li key={w}>{w}</li>
+              ))}
+            </ul>
+          </div>
+        )}
 
         {candidate.reasoning && (
           <p className="mb-5 rounded-md bg-paper px-3 py-2 text-sm text-ink-soft">

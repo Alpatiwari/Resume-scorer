@@ -5,7 +5,8 @@ from pydantic import BaseModel
 
 
 class ResumeStatus(str, Enum):
-    uploaded = "uploaded"
+    uploaded = "uploaded"  # queued, waiting for a worker
+    parsing = "parsing"    # a worker has picked it up
     parsed = "parsed"
     failed = "failed"
 

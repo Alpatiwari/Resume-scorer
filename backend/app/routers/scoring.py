@@ -1,6 +1,6 @@
 import csv
 import io
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from xml.sax.saxutils import escape
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -8,8 +8,10 @@ from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from app.config import SCORING_STALE_MINUTES
 from app.database import get_db
-from app.models.db_models import JobModel, ResumeModel, ScoreModel
+from app.models.db_models import JobModel, JobResumeModel, ResumeModel, ScoreModel
+from app.services.resume_status import expire_stale_parses
 from app.workers.celery_worker import score_job
 
 router = APIRouter(prefix="/api/score", tags=["scoring"])
@@ -37,6 +39,7 @@ def _serialize(score: ScoreModel, resume: ResumeModel | None) -> dict:
         "missing_skills": score.missing_skills or [],
         "red_flags": score.red_flags or [],
         "reasoning": score.reasoning,
+        "score_warnings": score.score_warnings or [],
         "scored_at": score.scored_at,
         "shortlisted": score.shortlisted,
         "stage": score.stage,
@@ -50,17 +53,38 @@ def _serialize(score: ScoreModel, resume: ResumeModel | None) -> dict:
 async def start_scoring(job_id: str, db: Session = Depends(get_db)):
     """Queues scoring as a background Celery task and returns immediately
     — it does NOT wait for scoring to finish. Poll GET /{job_id}/status
-    for progress, then GET /{job_id} once status is "done"."""
+    for progress, then GET /{job_id} once status is "done".
+
+    Only resumes uploaded to THIS job are scored. Re-scoring is allowed and
+    keeps shortlist/stage decisions."""
     job = db.get(JobModel, job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found.")
 
-    has_parsed = db.query(ResumeModel).filter(ResumeModel.status == "parsed").first()
+    # Don't start a second run while one is alive (two runs would race on the
+    # same score rows). A run with no progress for a while is presumed dead.
+    if job.scoring_status in ("queued", "running"):
+        beat = job.scoring_heartbeat_at
+        if beat is not None and beat.tzinfo is None:
+            beat = beat.replace(tzinfo=timezone.utc)
+        alive = beat is not None and datetime.now(timezone.utc) - beat < timedelta(minutes=SCORING_STALE_MINUTES)
+        if alive:
+            raise HTTPException(status_code=409, detail="Scoring is already in progress for this role.")
+
+    expire_stale_parses(db, job_id=job_id)
+    has_parsed = (
+        db.query(ResumeModel)
+        .join(JobResumeModel, JobResumeModel.resume_id == ResumeModel.id)
+        .filter(JobResumeModel.job_id == job_id, ResumeModel.status == "parsed")
+        .first()
+    )
     if not has_parsed:
-        raise HTTPException(status_code=400, detail="No parsed resumes to score yet. Upload some first.")
+        raise HTTPException(status_code=400, detail="No parsed resumes for this role yet. Upload some and wait for them to finish parsing.")
 
     job.scoring_status = "queued"
     job.scoring_error = None
+    job.scoring_done = 0
+    job.scoring_heartbeat_at = datetime.now(timezone.utc)
     db.commit()
 
     score_job.delay(job_id)
@@ -145,11 +169,12 @@ async def export_scores(
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(["Rank", "Candidate", "Final score", "Skill overlap", "Embedding", "LLM",
-                "Matched skills", "Missing skills", "Red flags", "Reasoning", "Stage", "Shortlisted"])
+                "Matched skills", "Missing skills", "Red flags", "Reasoning", "Stage", "Shortlisted", "Warnings"])
     for i, r in enumerate(rows, start=1):
         w.writerow([i, r.filename, r.final_score, r.skill_overlap_score, r.embedding_score,
                     r.llm_score, ", ".join(r.matched_skills or []), ", ".join(r.missing_skills or []),
-                    ", ".join(r.red_flags or []), r.reasoning, r.stage, "Yes" if r.shortlisted else "No"])
+                    ", ".join(r.red_flags or []), r.reasoning, r.stage, "Yes" if r.shortlisted else "No",
+                    " | ".join(r.score_warnings or [])])
 
     return StreamingResponse(
         iter([buf.getvalue()]),

@@ -26,3 +26,18 @@ def on_startup() -> None:
 @app.get("/api/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.get("/api/health/llm")
+def health_llm():
+    """Makes one tiny real Gemini call with the configured key and model.
+    Open this in a browser after changing GEMINI_MODEL / GEMINI_API_KEY: a wrong
+    model name shows up here immediately instead of as degraded scores later."""
+    from app.config import GEMINI_MODEL
+    from app.services.gemini_client import GeminiUnavailableError, chat_json
+
+    try:
+        chat_json('Return exactly this JSON and nothing else: {"ok": true}')
+    except GeminiUnavailableError as e:
+        return {"ok": False, "model": GEMINI_MODEL, "error": str(e)}
+    return {"ok": True, "model": GEMINI_MODEL, "error": None}
