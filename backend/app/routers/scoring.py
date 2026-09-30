@@ -10,17 +10,19 @@ from sqlalchemy.orm import Session
 
 from app.config import SCORING_STALE_MINUTES
 from app.database import get_db
-from app.models.db_models import JobModel, JobResumeModel, ResumeModel, ScoreModel
+from app.dependencies import get_current_user, get_owned_job, get_owned_score
+from app.models.db_models import JobResumeModel, ResumeModel, ScoreModel, UserModel
+from app.services.email_draft import KINDS as EMAIL_KINDS, build_draft, extract_email, extract_name, mailto_link
 from app.services.resume_status import expire_stale_parses
 from app.workers.celery_worker import score_job
 
-router = APIRouter(prefix="/api/score", tags=["scoring"])
+router = APIRouter(prefix="/api/score", tags=["scoring"], dependencies=[Depends(get_current_user)])
 
 # Hiring pipeline. "shortlisted" (the boolean) stays in sync with this so the
 # existing checkbox / filter / CSV keep working: anything past "new" that
 # isn't "rejected" counts as shortlisted.
-STAGES = ["new", "shortlisted", "interview", "offer", "rejected"]
-_SHORTLISTED_STAGES = {"shortlisted", "interview", "offer"}
+STAGES = ["new", "shortlisted", "interview", "offer", "hired", "rejected"]
+_SHORTLISTED_STAGES = {"shortlisted", "interview", "offer", "hired"}
 
 
 def _serialize(score: ScoreModel, resume: ResumeModel | None) -> dict:
@@ -31,6 +33,7 @@ def _serialize(score: ScoreModel, resume: ResumeModel | None) -> dict:
         "job_id": score.job_id,
         "resume_id": score.resume_id,
         "filename": score.filename,
+        "candidate_name": extract_name(resume.extracted_text if resume else None, score.filename),
         "final_score": score.final_score,
         "skill_overlap_score": score.skill_overlap_score,
         "embedding_score": score.embedding_score,
@@ -43,6 +46,7 @@ def _serialize(score: ScoreModel, resume: ResumeModel | None) -> dict:
         "scored_at": score.scored_at,
         "shortlisted": score.shortlisted,
         "stage": score.stage,
+        "notes": score.notes or "",
         "experience_years": resume.profile_experience_years if resume else None,
         "education": (resume.profile_education if resume else None) or [],
         "projects": (resume.profile_projects if resume else None) or [],
@@ -50,16 +54,14 @@ def _serialize(score: ScoreModel, resume: ResumeModel | None) -> dict:
 
 
 @router.post("/{job_id}")
-async def start_scoring(job_id: str, db: Session = Depends(get_db)):
+async def start_scoring(job_id: str, db: Session = Depends(get_db), user: UserModel = Depends(get_current_user)):
     """Queues scoring as a background Celery task and returns immediately
     — it does NOT wait for scoring to finish. Poll GET /{job_id}/status
     for progress, then GET /{job_id} once status is "done".
 
     Only resumes uploaded to THIS job are scored. Re-scoring is allowed and
     keeps shortlist/stage decisions."""
-    job = db.get(JobModel, job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found.")
+    job = get_owned_job(db, job_id, user)
 
     # Don't start a second run while one is alive (two runs would race on the
     # same score rows). A run with no progress for a while is presumed dead.
@@ -93,10 +95,8 @@ async def start_scoring(job_id: str, db: Session = Depends(get_db)):
 
 
 @router.get("/{job_id}/status")
-async def get_scoring_status(job_id: str, db: Session = Depends(get_db)):
-    job = db.get(JobModel, job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found.")
+async def get_scoring_status(job_id: str, db: Session = Depends(get_db), user: UserModel = Depends(get_current_user)):
+    job = get_owned_job(db, job_id, user)
 
     return {
         "status": job.scoring_status,
@@ -111,10 +111,10 @@ class ShortlistIn(BaseModel):
 
 
 @router.patch("/item/{score_id}/shortlist")
-async def set_shortlist(score_id: int, body: ShortlistIn, db: Session = Depends(get_db)):
-    score = db.get(ScoreModel, score_id)
-    if not score:
-        raise HTTPException(status_code=404, detail="Score not found.")
+async def set_shortlist(
+    score_id: int, body: ShortlistIn, db: Session = Depends(get_db), user: UserModel = Depends(get_current_user)
+):
+    score = get_owned_score(db, score_id, user)
     score.shortlisted = body.shortlisted
     if body.shortlisted and score.stage not in _SHORTLISTED_STAGES:
         score.stage = "shortlisted"
@@ -129,17 +129,74 @@ class StageIn(BaseModel):
 
 
 @router.patch("/item/{score_id}/stage")
-async def set_stage(score_id: int, body: StageIn, db: Session = Depends(get_db)):
+async def set_stage(
+    score_id: int, body: StageIn, db: Session = Depends(get_db), user: UserModel = Depends(get_current_user)
+):
     """Moves a candidate to another hiring stage."""
     if body.stage not in STAGES:
         raise HTTPException(status_code=422, detail=f"Stage must be one of: {', '.join(STAGES)}.")
-    score = db.get(ScoreModel, score_id)
-    if not score:
-        raise HTTPException(status_code=404, detail="Score not found.")
+    score = get_owned_score(db, score_id, user)
     score.stage = body.stage
     score.shortlisted = body.stage in _SHORTLISTED_STAGES
     db.commit()
     return {"id": score.id, "stage": score.stage, "shortlisted": score.shortlisted}
+
+
+class NotesIn(BaseModel):
+    notes: str
+
+
+@router.patch("/item/{score_id}/notes")
+async def set_notes(
+    score_id: int, body: NotesIn, db: Session = Depends(get_db), user: UserModel = Depends(get_current_user)
+):
+    """Saves the recruiter's private note for a candidate."""
+    score = get_owned_score(db, score_id, user)
+    score.notes = body.notes.strip()[:2000]
+    db.commit()
+    return {"id": score.id, "notes": score.notes}
+
+
+class EmailDraftIn(BaseModel):
+    kind: str  # interview | rejection | offer
+
+
+@router.post("/item/{score_id}/email-draft")
+async def email_draft(
+    score_id: int, body: EmailDraftIn, db: Session = Depends(get_db), user: UserModel = Depends(get_current_user)
+):
+    """Builds an editable email draft for this candidate. Nothing is sent: the
+    frontend opens it in the recruiter's own mail app via the mailto link."""
+    if body.kind not in EMAIL_KINDS:
+        raise HTTPException(status_code=422, detail=f"Kind must be one of: {', '.join(EMAIL_KINDS)}.")
+    score = get_owned_score(db, score_id, user)
+    job = get_owned_job(db, score.job_id, user)
+    resume = db.get(ResumeModel, score.resume_id)
+    text = resume.extracted_text if resume else None
+
+    name = extract_name(text, score.filename)
+    to = extract_email(text)
+    draft = build_draft(
+        body.kind, candidate_name=name, job_title=job.title, recruiter_name=user.full_name
+    )
+    return {
+        "kind": body.kind,
+        "to": to,
+        "candidate_name": name,
+        "subject": draft["subject"],
+        "body": draft["body"],
+        "mailto": mailto_link(to, draft["subject"], draft["body"]),
+    }
+
+
+def csv_safe(value):
+    """Stops spreadsheet formula injection. Excel/Sheets run any cell that starts
+    with = + - @ (or a tab/CR) as a formula, and filenames and AI-written text
+    come from untrusted resumes. A leading ' makes the cell plain text.
+    Numbers and other non-strings are returned unchanged."""
+    if isinstance(value, str) and value[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + value
+    return value
 
 
 def _export_rows(db: Session, job_id: str, shortlisted_only: bool, min_score: float, stage: str | None):
@@ -163,7 +220,9 @@ async def export_scores(
     min_score: float = 0,
     stage: str | None = None,
     db: Session = Depends(get_db),
+    user: UserModel = Depends(get_current_user),
 ):
+    get_owned_job(db, job_id, user)
     rows = _export_rows(db, job_id, shortlisted_only, min_score, stage)
 
     buf = io.StringIO()
@@ -171,10 +230,12 @@ async def export_scores(
     w.writerow(["Rank", "Candidate", "Final score", "Skill overlap", "Embedding", "LLM",
                 "Matched skills", "Missing skills", "Red flags", "Reasoning", "Stage", "Shortlisted", "Warnings"])
     for i, r in enumerate(rows, start=1):
-        w.writerow([i, r.filename, r.final_score, r.skill_overlap_score, r.embedding_score,
-                    r.llm_score, ", ".join(r.matched_skills or []), ", ".join(r.missing_skills or []),
-                    ", ".join(r.red_flags or []), r.reasoning, r.stage, "Yes" if r.shortlisted else "No",
-                    " | ".join(r.score_warnings or [])])
+        w.writerow([csv_safe(v) for v in (
+            i, r.filename, r.final_score, r.skill_overlap_score, r.embedding_score, r.llm_score,
+            ", ".join(r.matched_skills or []), ", ".join(r.missing_skills or []),
+            ", ".join(r.red_flags or []), r.reasoning, r.stage, "Yes" if r.shortlisted else "No",
+            " | ".join(r.score_warnings or []),
+        )])
 
     return StreamingResponse(
         iter([buf.getvalue()]),
@@ -190,6 +251,7 @@ async def export_scores_pdf(
     min_score: float = 0,
     stage: str | None = None,
     db: Session = Depends(get_db),
+    user: UserModel = Depends(get_current_user),
 ):
     """Same filters as the CSV export, rendered as a printable PDF report."""
     from reportlab.lib import colors
@@ -198,9 +260,7 @@ async def export_scores_pdf(
     from reportlab.lib.units import mm
     from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
-    job = db.get(JobModel, job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found.")
+    job = get_owned_job(db, job_id, user)
     rows = _export_rows(db, job_id, shortlisted_only, min_score, stage)
 
     styles = getSampleStyleSheet()
@@ -265,7 +325,8 @@ async def export_scores_pdf(
 
 
 @router.get("/{job_id}")
-async def get_scores(job_id: str, db: Session = Depends(get_db)):
+async def get_scores(job_id: str, db: Session = Depends(get_db), user: UserModel = Depends(get_current_user)):
+    get_owned_job(db, job_id, user)
     pairs = (
         db.query(ScoreModel, ResumeModel)
         .outerjoin(ResumeModel, ResumeModel.id == ScoreModel.resume_id)

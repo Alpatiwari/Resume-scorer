@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { uploadResumes, listJobResumes, retryResume } from '../api/apiClient.js'
+import { uploadResumes, listJobResumes, retryResume, deleteResume } from '../api/apiClient.js'
 
 const ACCEPTED = ['.pdf', '.docx']
 const POLL_INTERVAL_MS = 1500
 const SLOW_HINT_AFTER_MS = 90_000
 
-export default function UploadResumes({ jobId, disabled, onResumesChanged }) {
+export default function UploadResumes({ jobId, disabled, onResumesChanged, onResumeDeleted }) {
   const [isDragging, setIsDragging] = useState(false)
   const [pendingFiles, setPendingFiles] = useState([])
   const [batch, setBatch] = useState([]) // this role's resumes, straight from the server
@@ -89,6 +89,22 @@ export default function UploadResumes({ jobId, disabled, onResumesChanged }) {
       await refresh()
     } catch (err) {
       setError(err.message || 'Could not retry this resume.')
+    }
+  }
+
+  async function handleDelete(file) {
+    const ok = window.confirm(
+      `Permanently delete "${file.filename}"?\n\n` +
+        'Its scores, notes and stored file are removed too, and it disappears from every role it was added to. This cannot be undone.'
+    )
+    if (!ok) return
+    setError(null)
+    try {
+      await deleteResume(file.id)
+      await refresh()
+      onResumeDeleted?.(file.id)
+    } catch (err) {
+      setError(err.message || 'Could not delete this resume.')
     }
   }
 
@@ -240,6 +256,14 @@ export default function UploadResumes({ jobId, disabled, onResumesChanged }) {
                     >
                       {statusLabel(f.status)}
                     </span>
+                    <button
+                      type="button"
+                      onClick={() => handleDelete(f)}
+                      aria-label={`Delete ${f.filename}`}
+                      className="text-xs text-ink-soft underline hover:text-red-700"
+                    >
+                      Delete
+                    </button>
                   </span>
                 </div>
                 {f.status === 'failed' && f.error && (

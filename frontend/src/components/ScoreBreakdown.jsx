@@ -1,35 +1,66 @@
 import { useEffect, useState } from 'react'
-import { getResume, resumeFileUrl } from '../api/apiClient.js'
+import { downloadResumeFile, fetchResumeFile, getEmailDraft, getResume } from '../api/apiClient.js'
 import { STAGES } from '../constants.js'
+import { candidateLabel } from '../utils.js'
 
 function ResumePreview({ candidate }) {
   const isPdf = candidate.filename?.toLowerCase().endsWith('.pdf')
   const [text, setText] = useState(null)
+  const [pdfUrl, setPdfUrl] = useState(null)
   const [error, setError] = useState(null)
 
   // Browsers can render PDFs natively in an iframe; DOCX can't be, so for
-  // those we show the text the parser extracted.
+  // those we show the text the parser extracted. An iframe can't send the
+  // login token, so the PDF is fetched with it and shown from a blob URL.
   useEffect(() => {
-    if (isPdf) return
     let cancelled = false
-    getResume(candidate.resume_id)
-      .then((r) => !cancelled && setText(r.extracted_text || ''))
-      .catch((e) => !cancelled && setError(e.message || 'Could not load resume text.'))
+    let objectUrl = null
+    setError(null)
+    setText(null)
+    setPdfUrl(null)
+
+    if (isPdf) {
+      fetchResumeFile(candidate.resume_id)
+        .then((blob) => {
+          if (cancelled) return
+          objectUrl = URL.createObjectURL(blob)
+          setPdfUrl(objectUrl)
+        })
+        .catch((e) => !cancelled && setError(e.message || 'Could not load the resume file.'))
+    } else {
+      getResume(candidate.resume_id)
+        .then((r) => !cancelled && setText(r.extracted_text || ''))
+        .catch((e) => !cancelled && setError(e.message || 'Could not load resume text.'))
+    }
+
     return () => {
       cancelled = true
+      if (objectUrl) URL.revokeObjectURL(objectUrl)
     }
   }, [candidate.resume_id, isPdf])
 
+  async function handleDownload() {
+    try {
+      await downloadResumeFile(candidate.resume_id, candidate.filename)
+    } catch (e) {
+      setError(e.message || 'Could not download the file.')
+    }
+  }
+
   return (
     <div className="mt-3">
-      {isPdf ? (
-        <iframe
-          title={`Resume: ${candidate.filename}`}
-          src={resumeFileUrl(candidate.resume_id)}
-          className="h-[60vh] w-full rounded-md border border-line"
-        />
-      ) : error ? (
+      {error ? (
         <p className="text-sm text-red-700">{error}</p>
+      ) : isPdf ? (
+        pdfUrl ? (
+          <iframe
+            title={`Resume: ${candidate.filename}`}
+            src={pdfUrl}
+            className="h-[60vh] w-full rounded-md border border-line"
+          />
+        ) : (
+          <p className="text-sm text-ink-soft">Loading…</p>
+        )
       ) : text === null ? (
         <p className="text-sm text-ink-soft">Loading…</p>
       ) : (
@@ -37,14 +68,13 @@ function ResumePreview({ candidate }) {
           {text}
         </pre>
       )}
-      <a
-        href={resumeFileUrl(candidate.resume_id)}
-        target="_blank"
-        rel="noreferrer"
+      <button
+        type="button"
+        onClick={handleDownload}
         className="mt-2 inline-block text-xs text-ink-soft underline hover:text-ink"
       >
-        Open original file
-      </a>
+        Download original file
+      </button>
     </div>
   )
 }
@@ -88,15 +118,168 @@ function Highlights({ candidate }) {
   )
 }
 
-export default function ScoreBreakdown({ candidate, onClose, onChangeStage }) {
+const EMAIL_KINDS = [
+  { value: 'interview', label: 'Interview invite' },
+  { value: 'rejection', label: 'Rejection' },
+  { value: 'offer', label: 'Offer' },
+]
+
+// Builds an editable draft for the candidate, then hands it to the recruiter's
+// Gmail (or their mail app via mailto:). Nothing is sent from this app.
+function EmailDraftPanel({ candidate }) {
+  const [draft, setDraft] = useState(null) // { kind, to, subject, body }
+  const [loadingKind, setLoadingKind] = useState(null)
+  const [error, setError] = useState(null)
+  const [copied, setCopied] = useState(false)
+
+  // A different candidate means a different draft.
+  useEffect(() => {
+    setDraft(null)
+    setError(null)
+    setCopied(false)
+  }, [candidate.id])
+
+  async function handlePick(kind) {
+    setLoadingKind(kind)
+    setError(null)
+    setCopied(false)
+    try {
+      const d = await getEmailDraft(candidate.id, kind)
+      setDraft({ kind, to: d.to || '', subject: d.subject, body: d.body })
+    } catch (e) {
+      setError(e.message || 'Could not create the draft.')
+    } finally {
+      setLoadingKind(null)
+    }
+  }
+
+  function mailtoHref() {
+    return (
+      `mailto:${encodeURIComponent(draft.to).replace(/%40/g, '@')}` +
+      `?subject=${encodeURIComponent(draft.subject)}&body=${encodeURIComponent(draft.body)}`
+    )
+  }
+
+  // Gmail's web compose window: works in any browser signed in to Gmail,
+  // with no mail app set up. URLSearchParams encodes spaces as '+', which
+  // Gmail reads correctly.
+  function gmailHref() {
+    const params = new URLSearchParams({ view: 'cm', fs: '1', su: draft.subject, body: draft.body })
+    if (draft.to) params.set('to', draft.to)
+    return `https://mail.google.com/mail/?${params.toString()}`
+  }
+
+  async function handleCopy() {
+    try {
+      await navigator.clipboard.writeText(`Subject: ${draft.subject}\n\n${draft.body}`)
+      setCopied(true)
+    } catch {
+      setError('Could not copy — select the text and copy it manually.')
+    }
+  }
+
+  const field = 'w-full rounded-md border border-line bg-white px-3 py-2 text-sm text-ink'
+
+  return (
+    <div className="mb-5">
+      <p className="mb-1 text-xs font-medium text-ink-soft">Email draft</p>
+      <div className="flex flex-wrap gap-2">
+        {EMAIL_KINDS.map((k) => (
+          <button
+            key={k.value}
+            type="button"
+            onClick={() => handlePick(k.value)}
+            disabled={loadingKind !== null}
+            className={`rounded-md border px-3 py-1 text-sm text-ink hover:bg-paper disabled:opacity-40 ${
+              draft?.kind === k.value ? 'border-ink' : 'border-line'
+            }`}
+          >
+            {loadingKind === k.value ? 'Drafting…' : k.label}
+          </button>
+        ))}
+      </div>
+
+      {error && <p className="mt-2 text-xs text-red-700">{error}</p>}
+
+      {draft && (
+        <div className="mt-3 flex flex-col gap-2">
+          <input
+            value={draft.to}
+            onChange={(e) => setDraft({ ...draft, to: e.target.value })}
+            placeholder="Recipient email — none found in the resume, add it here"
+            aria-label="Recipient email"
+            className={field}
+          />
+          <input
+            value={draft.subject}
+            onChange={(e) => setDraft({ ...draft, subject: e.target.value })}
+            aria-label="Subject"
+            className={field}
+          />
+          <textarea
+            value={draft.body}
+            onChange={(e) => setDraft({ ...draft, body: e.target.value })}
+            rows={9}
+            aria-label="Email body"
+            className={`${field} resize-y`}
+          />
+          <div className="flex items-center gap-3">
+            <a
+              href={gmailHref()}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="rounded-md bg-ink px-3 py-1 text-sm text-white"
+            >
+              Open in Gmail
+            </a>
+            <a
+              href={mailtoHref()}
+              className="rounded-md border border-line px-3 py-1 text-sm text-ink hover:bg-paper"
+            >
+              Mail app
+            </a>
+            <button
+              type="button"
+              onClick={handleCopy}
+              className="rounded-md border border-line px-3 py-1 text-sm text-ink hover:bg-paper"
+            >
+              {copied ? 'Copied' : 'Copy'}
+            </button>
+            <span className="text-xs text-ink-soft">Review before sending.</span>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+export default function ScoreBreakdown({ candidate, onClose, onChangeStage, onSaveNotes }) {
   const [showPreview, setShowPreview] = useState(false)
+
+  // Recruiter notes: `notes` is what's typed, `savedNotes` is what the server has.
+  const [notes, setNotes] = useState('')
+  const [savedNotes, setSavedNotes] = useState('')
+  const [savingNotes, setSavingNotes] = useState(false)
 
   // Collapse the preview when switching to a different candidate.
   useEffect(() => {
     setShowPreview(false)
   }, [candidate?.resume_id])
 
+  // Load the saved note whenever a different candidate is opened.
+  useEffect(() => {
+    setNotes(candidate?.notes || '')
+    setSavedNotes(candidate?.notes || '')
+  }, [candidate?.id])
+
   if (!candidate) return null
+
+  async function handleSaveClick() {
+    setSavingNotes(true)
+    const ok = await onSaveNotes?.(candidate, notes)
+    if (ok) setSavedNotes(notes)
+    setSavingNotes(false)
+  }
 
   const legs = [
     { label: 'Skill overlap', value: candidate.skill_overlap_score },
@@ -115,8 +298,10 @@ export default function ScoreBreakdown({ candidate, onClose, onChangeStage }) {
       >
         <div className="mb-4 flex items-start justify-between gap-4">
           <div>
-            <h3 className="font-display text-lg text-ink">{candidate.filename}</h3>
-            <p className="text-sm text-ink-soft">Score breakdown</p>
+            <h3 className="font-display text-lg text-ink">{candidateLabel(candidate)}</h3>
+            <p className="text-sm text-ink-soft">
+              Score breakdown{candidate.candidate_name ? ` · ${candidate.filename}` : ''}
+            </p>
           </div>
           <button
             onClick={onClose}
@@ -168,6 +353,35 @@ export default function ScoreBreakdown({ candidate, onClose, onChangeStage }) {
             </div>
           ))}
         </div>
+
+        <div className="mb-5">
+          <label className="mb-1 block text-xs font-medium text-ink-soft">
+            Recruiter notes (private)
+          </label>
+          <textarea
+            value={notes}
+            onChange={(e) => setNotes(e.target.value)}
+            rows={3}
+            maxLength={2000}
+            placeholder="e.g. Good communication, call on Monday"
+            className="w-full resize-y rounded-md border border-line bg-white px-3 py-2 text-sm text-ink"
+          />
+          <div className="mt-1 flex items-center gap-3">
+            <button
+              type="button"
+              onClick={handleSaveClick}
+              disabled={savingNotes || notes === savedNotes}
+              className="rounded-md bg-ink px-3 py-1 text-sm text-white disabled:opacity-40"
+            >
+              {savingNotes ? 'Saving…' : 'Save note'}
+            </button>
+            {notes === savedNotes && savedNotes && (
+              <span className="text-xs text-ink-soft">Saved</span>
+            )}
+          </div>
+        </div>
+
+        <EmailDraftPanel candidate={candidate} />
 
         {candidate.score_warnings?.length > 0 && (
           <div className="mb-5 rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-800">

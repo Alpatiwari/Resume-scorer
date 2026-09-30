@@ -13,6 +13,14 @@ MAX_FILE_SIZE_MB = 10
 
 
 
+# Browser origins allowed to call the API (comma separated). Set this to your
+# deployed frontend URL(s), e.g. RESUME_SCORER_CORS_ORIGINS=https://app.example.com
+CORS_ORIGINS = [
+    o.strip()
+    for o in os.environ.get("RESUME_SCORER_CORS_ORIGINS", "http://localhost:5173").split(",")
+    if o.strip()
+]
+
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 GEMINI_MODEL = os.environ.get("RESUME_SCORER_GEMINI_MODEL", "gemini-3.6-flash")
 
@@ -29,10 +37,15 @@ ALLOW_DEGRADED_SCORING = os.environ.get("RESUME_SCORER_ALLOW_DEGRADED_SCORING", 
 EMBEDDING_MODEL = os.environ.get("RESUME_SCORER_EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 
 
+# Must add up to 1.0. The embedding leg is weighted lowest: raw cosine
+# similarity from a small model is on a different scale from the other legs
+# and only "sees" the start of a long resume. "experience" only counts when
+# the job states a minimum number of years and the resume's years are known.
 SCORE_WEIGHTS = {
     "skill_overlap": 0.30,
-    "embedding": 0.25,
+    "embedding": 0.15,
     "llm": 0.45,
+    "experience": 0.10,
 }
 
 
@@ -45,3 +58,18 @@ PARSE_TIMEOUT_MINUTES = int(os.environ.get("RESUME_SCORER_PARSE_TIMEOUT_MINUTES"
 PARSE_SOFT_TIME_LIMIT_SECONDS = int(os.environ.get("RESUME_SCORER_PARSE_SOFT_LIMIT_SECONDS", "120"))
 # A scoring run with no progress for this long is treated as dead and may be restarted.
 SCORING_STALE_MINUTES = int(os.environ.get("RESUME_SCORER_SCORING_STALE_MINUTES", "15"))
+
+
+# --- Authentication (JWT) ---
+# No default on purpose: a guessable signing key would let anyone forge logins.
+# Generate one with:  python -c "import secrets; print(secrets.token_urlsafe(48))"
+JWT_SECRET_KEY = os.environ.get("JWT_SECRET_KEY")
+JWT_ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.environ.get("RESUME_SCORER_ACCESS_TOKEN_MINUTES", "480"))  # 8h = one workday
+
+# Set to "false" once your recruiters have accounts (create more with create_user.py).
+ALLOW_REGISTRATION = os.environ.get("RESUME_SCORER_ALLOW_REGISTRATION", "true").lower() == "true"
+
+# Failed logins allowed per (client IP, email) inside the window before a temporary lockout.
+LOGIN_MAX_FAILURES = int(os.environ.get("RESUME_SCORER_LOGIN_MAX_FAILURES", "5"))
+LOGIN_FAILURE_WINDOW_SECONDS = int(os.environ.get("RESUME_SCORER_LOGIN_WINDOW_SECONDS", "900"))

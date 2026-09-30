@@ -14,10 +14,30 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+class UserModel(Base):
+    """A recruiter account. Every role (and, through it, every resume and score)
+    belongs to exactly one user."""
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    # Stored lower-cased; the unique index makes duplicate sign-ups impossible.
+    email: Mapped[str] = mapped_column(String, nullable=False, unique=True, index=True)
+    full_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    password_hash: Mapped[str] = mapped_column(String, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
 class JobModel(Base):
     __tablename__ = "jobs"
 
     id: Mapped[str] = mapped_column(String, primary_key=True)
+    # The recruiter who created the role. Nullable only so roles created before
+    # login existed survive the migration; see migrate_auth.py. A role with no
+    # owner is invisible to everyone until it is assigned.
+    owner_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
+    )
     title: Mapped[str] = mapped_column(String, nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False)
     experience: Mapped[str | None] = mapped_column(String, nullable=True)
@@ -45,6 +65,11 @@ class ResumeModel(Base):
     __tablename__ = "resumes"
 
     id: Mapped[str] = mapped_column(String, primary_key=True)
+    # Whose upload this is. Duplicate detection (content_hash) only matches
+    # within one owner, so two recruiters never share a resume record.
+    owner_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
+    )
     filename: Mapped[str] = mapped_column(String, nullable=False)
     status: Mapped[str] = mapped_column(String, nullable=False)
     uploaded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
@@ -108,8 +133,9 @@ class ScoreModel(Base):
 
     scored_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     shortlisted: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
-    # Hiring pipeline stage: new | shortlisted | interview | offer | rejected
+    # Hiring pipeline stage: new | shortlisted | interview | offer | hired | rejected
     stage: Mapped[str] = mapped_column(String, default="new", server_default="new", nullable=False)
+    notes: Mapped[str] = mapped_column(Text, default="", server_default="", nullable=False)
 
     job: Mapped["JobModel"] = relationship(back_populates="scores")
     resume: Mapped["ResumeModel"] = relationship(back_populates="scores")

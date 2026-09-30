@@ -19,7 +19,12 @@ import re
 from dataclasses import dataclass, field
 
 from app.services.gemini_client import GeminiUnavailableError, chat_json
-from app.services.skill_dictionary import SKILL_ALIASES
+from app.services.skill_dictionary import (
+    CASE_SENSITIVE_ALIASES,
+    CONTEXT_PATTERNS,
+    SKILL_ALIASES,
+    normalize_skills,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -48,30 +53,132 @@ class JobRequirements:
 # Pass 1: regex + skill dictionary
 # ---------------------------------------------------------------------------
 
+_BOUNDARY_BEFORE = r"(?<![a-zA-Z0-9])"
+_BOUNDARY_AFTER = r"(?![a-zA-Z0-9])"
+
+
 def _find_skills_regex(text: str) -> list[str]:
     text_lower = text.lower()
-    found = []
+    found: list[str] = []
     for canonical, aliases in SKILL_ALIASES.items():
-        candidates = [canonical.lower(), *[a.lower() for a in aliases]]
+        candidates = [a.lower() for a in aliases]
+        # "Go" and "Excel" are ordinary words, so their bare name is NOT
+        # matched here — only through CONTEXT_PATTERNS below.
+        if canonical not in CONTEXT_PATTERNS:
+            candidates.append(canonical.lower())
         for candidate in candidates:
-            # word-boundary match so "go" doesn't match inside "google"
-            pattern = r"(?<![a-zA-Z0-9])" + re.escape(candidate) + r"(?![a-zA-Z0-9])"
+            pattern = _BOUNDARY_BEFORE + re.escape(candidate) + _BOUNDARY_AFTER
             if re.search(pattern, text_lower):
                 found.append(canonical)
                 break
+
+    # Case-sensitive aliases: "JS", "ML" only count when written that way.
+    for canonical, aliases in CASE_SENSITIVE_ALIASES.items():
+        if canonical in found:
+            continue
+        for alias in aliases:
+            if re.search(_BOUNDARY_BEFORE + re.escape(alias) + _BOUNDARY_AFTER, text):
+                found.append(canonical)
+                break
+
+    # Everyday-word skills ("Go", "Excel"): matched by context patterns only.
+    for canonical, patterns in CONTEXT_PATTERNS.items():
+        if canonical in found:
+            continue
+        if any(re.search(p, text, flags=re.MULTILINE) for p in patterns):
+            found.append(canonical)
+
     return found
 
 
-_YEARS_PATTERN = re.compile(
-    r"(\d+(?:\.\d+)?)\+?\s*(?:years|yrs)\s*(?:of)?\s*experience", re.IGNORECASE
+# --- years of experience -------------------------------------------------
+
+_NUMBER_WORDS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
+    "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12, "fifteen": 15,
+    "twenty": 20,
+}
+_NUM = r"(\d+(?:\.\d+)?|" + "|".join(_NUMBER_WORDS) + r")"
+_UNIT = r"\s*\+?\s*(?:years?|yrs?)"
+
+# "5 years of experience", "3-5 yrs experience", "five years of professional experience"
+_YEARS_BEFORE = re.compile(
+    _NUM + r"(?:\s*(?:-|\u2013|to)\s*" + _NUM + r")?" + _UNIT
+    + r"(?:\s+of)?(?:\s+[\w/+.#&-]+){0,4}?\s+experience",
+    re.IGNORECASE,
+)
+# "experience: 5 years", "experience of 3+ years"
+_YEARS_AFTER = re.compile(
+    r"experience\s*(?:of|:|-)?\s*(?:at least\s*|minimum\s*(?:of\s*)?)?" + _NUM + _UNIT,
+    re.IGNORECASE,
+)
+# "at least 3 years", "minimum 5 years"
+_YEARS_MIN = re.compile(
+    r"(?:at least|minimum(?:\s+of)?|min\.?)\s*" + _NUM + _UNIT, re.IGNORECASE
 )
 
 
+def _to_number(token: str) -> float:
+    token = token.lower()
+    return float(_NUMBER_WORDS[token]) if token in _NUMBER_WORDS else float(token)
+
+
 def _find_experience_years_regex(text: str) -> float | None:
-    matches = _YEARS_PATTERN.findall(text)
-    if not matches:
-        return None
-    return max(float(m) for m in matches)
+    """Largest stated years-of-experience figure. For a range ("3-5 years") the
+    lower bound is used. Date ranges ("2019-2024") are left to the AI pass."""
+    values: list[float] = []
+    for m in _YEARS_BEFORE.finditer(text):
+        values.append(_to_number(m.group(1)))  # group 1 = lower bound of a range
+    for pattern in (_YEARS_AFTER, _YEARS_MIN):
+        for m in pattern.finditer(text):
+            values.append(_to_number(m.group(1)))
+    return max(values) if values else None
+
+
+# --- required vs nice-to-have split of a job description ------------------
+
+_NICE_MARKER = re.compile(
+    r"nice[\s-]*to[\s-]*have|good[\s-]*to[\s-]*have|\b(?:is|are)\s+a\s+(?:plus|bonus)\b"
+    r"|\ba\s+plus\b|\bbonus\b|\bpreferred\b|\bdesirable\b",
+    re.IGNORECASE,
+)
+_NICE_HEADING = re.compile(
+    r"^[\W_]*(?:nice[\s-]*to[\s-]*have|good[\s-]*to[\s-]*have|preferred(?:\s+(?:qualifications|skills|requirements))?"
+    r"|bonus(?:\s+points)?|desirable|optional)\b[^\n]{0,40}$",
+    re.IGNORECASE,
+)
+_REQUIRED_HEADING = re.compile(
+    r"^[\W_]*(?:required|requirements|responsibilities|qualifications|must[\s-]*have|key skills"
+    r"|what you(?:'ll| will)?|who you are|about|benefits|what we offer|skills)\b[^\n]{0,40}$",
+    re.IGNORECASE,
+)
+
+
+def _split_job_sections(text: str) -> tuple[str, str]:
+    """Splits a job description into (required_text, nice_to_have_text).
+
+    A heading like "Nice to have:" sends the lines under it to the nice side
+    until a required-style heading appears. A single sentence that says "... is
+    a plus" / "preferred" / "nice to have: ..." is nice-to-have wherever it is.
+    """
+    required: list[str] = []
+    nice: list[str] = []
+    state = "required"
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if len(line) < 70 and _NICE_HEADING.match(line):
+            state = "nice"
+        elif len(line) < 70 and _REQUIRED_HEADING.match(line):
+            state = "required"
+        # sentence-level marker check ("Docker is a plus." / "Nice to have: X.")
+        for sentence in re.split(r"(?<=[.!?;])\s+", line):
+            if _NICE_MARKER.search(sentence):
+                nice.append(sentence)
+            else:
+                (nice if state == "nice" else required).append(sentence)
+    return "\n".join(required), "\n".join(nice)
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +259,7 @@ def extract_resume_profile(text: str) -> ResumeProfile:
     llm_data, llm_error = _call_llm_json(_RESUME_EXTRACTION_PROMPT.format(text=text[:12000]))
 
     if llm_data:
-        merged_skills = sorted(set(regex_skills) | set(_str_list(llm_data.get("skills"))))
+        merged_skills = sorted(normalize_skills([*regex_skills, *_str_list(llm_data.get("skills"))]))
         years = _num_or_none(llm_data.get("experience_years"))
         return ResumeProfile(
             skills=merged_skills,
@@ -168,21 +275,34 @@ def extract_resume_profile(text: str) -> ResumeProfile:
 
 
 def extract_job_requirements(text: str) -> JobRequirements:
-    regex_skills = _find_skills_regex(text)
+    required_text, nice_text = _split_job_sections(text)
+    regex_required = _find_skills_regex(required_text)
+    regex_nice = _find_skills_regex(nice_text)
     regex_years = _find_experience_years_regex(text)
 
     llm_data, llm_error = _call_llm_json(_JOB_EXTRACTION_PROMPT.format(text=text[:12000]))
 
     if llm_data:
-        merged_required = sorted(set(regex_skills) | set(_str_list(llm_data.get("required_skills"))))
+        llm_required = _str_list(llm_data.get("required_skills"))
+        nice = normalize_skills([*regex_nice, *_str_list(llm_data.get("nice_to_have_skills"))])
+        nice_keys = {n.lower() for n in nice}
+        # Skills found in the required part of the text stay required. A skill
+        # only the AI called required is dropped if it is listed as nice-to-have.
+        required = normalize_skills([
+            *regex_required,
+            *[s for s in normalize_skills(llm_required) if s.lower() not in nice_keys],
+        ])
         years = _num_or_none(llm_data.get("min_experience_years"))
         return JobRequirements(
-            required_skills=merged_required,
-            nice_to_have_skills=_str_list(llm_data.get("nice_to_have_skills")),
+            required_skills=sorted(required),
+            nice_to_have_skills=sorted(nice),
             min_experience_years=years if years else regex_years,
             key_responsibilities=_str_list(llm_data.get("key_responsibilities")),
         )
 
     return JobRequirements(
-        required_skills=sorted(set(regex_skills)), min_experience_years=regex_years, llm_error=llm_error
+        required_skills=sorted(set(regex_required)),
+        nice_to_have_skills=sorted(set(regex_nice) - set(regex_required)),
+        min_experience_years=regex_years,
+        llm_error=llm_error,
     )

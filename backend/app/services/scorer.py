@@ -1,10 +1,11 @@
 """
-Combines the three scoring legs (see docs section 3 — "hybrid scoring"):
+Combines the scoring legs (see docs section 3 — "hybrid scoring"):
 
   - skill_overlap: % of the job's required skills the candidate's
     extracted profile actually shows.
   - embedding: semantic similarity between resume and JD text.
   - llm: an LLM's holistic, context-aware judgment.
+  - experience: years of experience vs the job's stated minimum (only when both are known).
 
 into one weighted 0-100 final score, plus an explanation a recruiter can
 read in a few seconds: matched skills, missing skills, red flags.
@@ -23,6 +24,7 @@ from app.config import SCORE_WEIGHTS
 from app.services.embeddings import semantic_similarity_score
 from app.services.llm_scorer import llm_judgment_score
 from app.services.nlp_extractor import JobRequirements, ResumeProfile, extract_resume_profile
+from app.services.skill_dictionary import normalize_skill, skill_key, with_implied
 
 
 class ScoringError(Exception):
@@ -51,23 +53,50 @@ def _short(text: str | None, limit: int = 220) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+# A nice-to-have skill counts half as much as a required one.
+NICE_TO_HAVE_WEIGHT = 0.5
+
+
 def _skill_overlap_score(
-    resume_skills: list[str], required_skills: list[str]
+    resume_skills: list[str],
+    required_skills: list[str],
+    nice_to_have_skills: list[str] | None = None,
 ) -> tuple[float | None, list[str], list[str]]:
+    """Returns (score, matched_required, missing_required).
+
+    Skills are compared by canonical name, so "React.js" matches "React" and
+    "REST API" matches "REST APIs". A skill that proves another counts too
+    (PostgreSQL satisfies SQL). Nice-to-have skills add to the score but are
+    never reported as missing."""
     if not required_skills:
         # Nothing to overlap with. That's "not applicable", not "0% match".
         return None, [], []
 
-    # Preserve original casing (e.g. "AWS", "FastAPI") by matching
-    # case-insensitively but keeping the required_skills list's own
-    # capitalization for display, rather than lower/title-casing it.
-    resume_lower = {s.lower() for s in resume_skills}
-    required_lower_to_original = {s.lower(): s for s in required_skills}
+    have = with_implied(resume_skills)
 
-    matched = sorted(orig for lower, orig in required_lower_to_original.items() if lower in resume_lower)
-    missing = sorted(orig for lower, orig in required_lower_to_original.items() if lower not in resume_lower)
-    score = (len(matched) / len(required_skills)) * 100
-    return score, matched, missing
+    def has(skill: str) -> bool:
+        return skill_key(normalize_skill(skill)) in have
+
+    required_unique = {skill_key(normalize_skill(s)): s for s in required_skills}
+    matched = sorted(orig for key, orig in required_unique.items() if key in have)
+    missing = sorted(orig for key, orig in required_unique.items() if key not in have)
+
+    nice_unique = {skill_key(normalize_skill(s)): s for s in (nice_to_have_skills or [])}
+    nice_unique = {k: v for k, v in nice_unique.items() if k not in required_unique}
+    nice_matched = sum(1 for key in nice_unique if key in have)
+
+    earned = len(matched) + NICE_TO_HAVE_WEIGHT * nice_matched
+    possible = len(required_unique) + NICE_TO_HAVE_WEIGHT * len(nice_unique)
+    return (earned / possible) * 100, matched, missing
+
+
+def _experience_score(candidate_years: float | None, min_years: float | None) -> float | None:
+    """100 if the candidate meets the stated minimum, scaled down below it.
+    None (leg not counted) when the job states no minimum or the resume's
+    years are unknown."""
+    if not min_years or min_years <= 0 or candidate_years is None:
+        return None
+    return min(1.0, candidate_years / min_years) * 100
 
 
 def score_resume(
@@ -98,8 +127,9 @@ def score_resume(
         )
 
     skill_score, matched_from_dict, missing_from_dict = _skill_overlap_score(
-        profile.skills, job_requirements.required_skills
+        profile.skills, job_requirements.required_skills, job_requirements.nice_to_have_skills
     )
+    exp_score = _experience_score(profile.experience_years, job_requirements.min_experience_years)
     embed_score = semantic_similarity_score(resume_text, job_text)
     llm_result = llm_judgment_score(resume_text, job_text)
     llm_score = llm_result["score"]
@@ -114,7 +144,19 @@ def score_resume(
             "This score is based on the remaining methods only."
         )
 
-    legs = {"skill_overlap": skill_score, "embedding": embed_score, "llm": llm_score}
+    if job_requirements.min_experience_years and profile.experience_years is None:
+        warnings.append(
+            "The job asks for a minimum of "
+            f"{job_requirements.min_experience_years:g} years, but this resume's years of experience "
+            "could not be determined, so experience was not counted."
+        )
+
+    legs = {
+        "skill_overlap": skill_score,
+        "embedding": embed_score,
+        "llm": llm_score,
+        "experience": exp_score,
+    }
     available = {name: value for name, value in legs.items() if value is not None}
     if not available:
         raise ScoringError("No scoring method produced a result. " + " ".join(warnings))
