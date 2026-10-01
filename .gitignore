@@ -29,3 +29,4 @@ backend/storage/*
 !backend/storage/.gitkeep
 *.rdb
 !.env.example
+!.env.example
