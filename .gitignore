@@ -28,3 +28,4 @@ build/
 backend/storage/*
 !backend/storage/.gitkeep
 *.rdb
+!.env.example
